@@ -24,6 +24,8 @@ SUMMARY="${OUT_PREFIX}.summary.txt"
 rm -f "$CSV" "$RTT_TMP" "$SORTED_RTT" "$P99_TIMESTAMPS" "$SUMMARY"
 
 echo "writing to: $OUT_PREFIX.{csv,summary.txt,p99_timestamps.txt}"
+echo "running ping to $HOST for ${DURATION}s (interval: ${INTERVAL}s)..."
+echo
 
 # Header
 echo "timestamp_utc,seq,rtt_ms" >> "$CSV"
@@ -31,11 +33,24 @@ echo "timestamp_utc,seq,rtt_ms" >> "$CSV"
 # We'll send a fixed count based on duration and interval (works on macOS & Linux)
 COUNT=$(( DURATION / INTERVAL ))
 
+# Progress reporting interval (every 10% or every 30 seconds, whichever is smaller)
+REPORT_INTERVAL=$(( COUNT / 10 ))
+if (( REPORT_INTERVAL == 0 || REPORT_INTERVAL > 30 )); then
+  REPORT_INTERVAL=30
+fi
+
 # macOS 'date' differs; we'll stick to a portable UTC ISO format from 'date -u'
 # Parse ping output lines, extracting seq and rtt; add our own timestamp at capture time.
 # We deliberately ignore lines without a time= (timeouts) but count them later via ping's summary.
 # NOTE: On Linux, 'icmp_seq='; on macOS, 'icmp_seq=' too. If missing, we'll leave seq blank.
 PING_CMD=( ping -n -c "$COUNT" -i "$INTERVAL" "$HOST" )
+
+# Initialize counters for live reporting
+reply_count=0
+timeout_count=0
+rtt_sum=0
+min_rtt=""
+max_rtt=""
 
 # Run ping and capture per-reply measurements
 # shellcheck disable=SC2068
@@ -60,9 +75,36 @@ PING_CMD=( ping -n -c "$COUNT" -i "$INTERVAL" "$HOST" )
     if [[ -n "$rtt" ]]; then
       echo "$ts,$seq,$rtt" >> "$CSV"
       echo "$rtt" >> "$RTT_TMP"
+      
+      # Update live stats
+      reply_count=$(( reply_count + 1 ))
+      rtt_sum=$(awk -v sum="$rtt_sum" -v rtt="$rtt" 'BEGIN{ printf("%.2f", sum + rtt) }')
+      
+      # Update min/max
+      if [[ -z "$min_rtt" ]] || (( $(awk -v a="$rtt" -v b="$min_rtt" 'BEGIN{ print (a < b) }') )); then
+        min_rtt="$rtt"
+      fi
+      if [[ -z "$max_rtt" ]] || (( $(awk -v a="$rtt" -v b="$max_rtt" 'BEGIN{ print (a > b) }') )); then
+        max_rtt="$rtt"
+      fi
+      
+      # Print live results every REPORT_INTERVAL replies
+      if (( reply_count % REPORT_INTERVAL == 0 )); then
+        avg_rtt=$(awk -v sum="$rtt_sum" -v count="$reply_count" 'BEGIN{ printf("%.1f", sum/count) }')
+        progress_pct=$(awk -v current="$reply_count" -v total="$COUNT" 'BEGIN{ printf("%.0f", 100*current/total) }')
+        printf "\r[%s%%] replies: %d, avg: %sms, min: %sms, max: %sms" \
+               "$progress_pct" "$reply_count" "$avg_rtt" "$min_rtt" "$max_rtt"
+      fi
+    fi
+  else
+    # Count timeouts (lines that don't contain 'time=')
+    if [[ "$line" == *"no answer"* ]] || [[ "$line" == *"Request timeout"* ]] || [[ "$line" == *"Destination Host Unreachable"* ]]; then
+      timeout_count=$(( timeout_count + 1 ))
     fi
   fi
 done
+
+echo  # New line after progress
 
 # Sort RTTs ascending for percentile math
 if [[ -s "$RTT_TMP" ]]; then
